@@ -19,9 +19,13 @@ class KInterpreter:
             ast.BitXor: operator.xor,
             ast.USub: operator.neg,
             ast.UAdd: operator.pos,
+            ast.Not: operator.not_,
+            ast.Invert: operator.invert,
         }
         # Supported types
         self.supported_types = {'int', 'float', 'string', 'char', 'bool', 'byte'}
+        # Supported modifiers
+        self.supported_modifiers = {'const'}
 
     def interpret(self, script):
         """
@@ -30,9 +34,9 @@ class KInterpreter:
         lines = script.split('\n')
         output = []
         for line_number, line in enumerate(lines, start=1):
-            original_line = line  # Keep the original line for scope handling
-            line = line.strip()
-            if not line or line.startswith('#'):  # Ignore empty lines and comments
+            # Remove inline comments
+            line = self.remove_inline_comments(line)
+            if not line:
                 continue
             if line == '{':
                 # Enter a new local scope
@@ -51,10 +55,17 @@ class KInterpreter:
                 if isinstance(result, list):
                     # If multiple items (like print with multiple arguments), join them
                     result = ' '.join(str(item) for item in result)
-                else:
-                    result = str(result)
                 output.append(result)
         return '\n'.join(output)
+
+    def remove_inline_comments(self, line):
+        """
+        Remove inline comments from a line.
+        """
+        comment_index = line.find('#')
+        if comment_index != -1:
+            line = line[:comment_index]
+        return line.strip()
 
     def execute_line(self, line, line_number):
         """
@@ -64,8 +75,8 @@ class KInterpreter:
             if line.startswith("print"):
                 # Handle print statement
                 return self.handle_print(line[5:].strip(), line_number)
-            elif re.match(r'^(private\s+)?(\w+\s+)?\w+\s*=\s*.*', line):
-                # Handle variable declaration with optional 'private' and type
+            elif re.match(r'^(private\s+)?(?:(const)\s+)?(\w+\s+)?\w+\s*=\s*.*', line):
+                # Handle variable declaration with optional 'private', 'const', and type
                 return self.handle_declaration(line, line_number)
             else:
                 return f"Line {line_number}: Unknown command: {line}"
@@ -88,14 +99,23 @@ class KInterpreter:
         values = []
         for expr in expressions:
             try:
-                value = self.evaluate_expression(expr, line_number)
-                # Check if the expression is a variable to determine its type
+                # Check if the expression is a variable for type-specific handling
                 var_info = self.get_variable_info(expr)
-                if var_info and var_info['type'] == 'byte':
-                    value = bin(var_info['value'])[2:]  # Convert to binary without '0b' prefix
-                elif isinstance(value, bool):
-                    value = str(value)
-                values.append(value)
+                if var_info:
+                    value = self.evaluate_expression(expr, line_number)
+                    if var_info['type'] == 'byte':
+                        # Convert to binary with leading zeros
+                        value = format(var_info['value'], '08b')
+                    elif var_info['type'] == 'bool':
+                        value = str(value)
+                    values.append(value)
+                else:
+                    # Expression is not a direct variable; evaluate it
+                    value = self.evaluate_expression(expr, line_number)
+                    # For standalone expressions, handle their types
+                    if isinstance(value, bool):
+                        value = str(value)
+                    values.append(value)
             except Exception as e:
                 values.append(str(e))
         return values  # Return as list to join with spaces in interpret()
@@ -131,16 +151,60 @@ class KInterpreter:
 
     def handle_declaration(self, line, line_number):
         """
-        Handle variable declarations with optional 'private' and type annotations.
-        Syntax: [private] [<type>] <varname> = <expression>
+        Handle variable declarations with optional 'private', 'const', and type annotations.
+        Syntax: [private] [const] [<type>] <varname> = <expression>
         """
         # Regex to parse the declaration
-        match = re.match(r'^(private\s+)?(?:(\w+)\s+)?(\w+)\s*=\s*(.+)$', line)
+        match = re.match(r'^(private\s+)?(?:(const)\s+)?(?:(\w+)\s+)?(\w+)\s*=\s*(.+)$', line)
         if not match:
             return f"Line {line_number}: Syntax Error: Invalid variable declaration."
 
-        is_private, var_type, var_name, expr = match.groups()
+        is_private, modifier, var_type, var_name, expr = match.groups()
 
+        # Check if the variable is already declared
+        var_info = self.get_variable_info(var_name)
+        if var_info:
+            # Variable is already declared; handle reassignment
+            if modifier:
+                return f"Line {line_number}: Syntax Error: Cannot redeclare variable '{var_name}' with modifier '{modifier}'."
+            if var_info['const']:
+                return f"Line {line_number}: Type Error: Cannot reassign to constant variable '{var_name}'."
+            if var_type:
+                return f"Line {line_number}: Syntax Error: Cannot change the type of an existing variable '{var_name}'."
+            # Reassignment without type
+            value = self.evaluate_expression(expr.strip(), line_number)
+            # Handle 'byte' type validation
+            if var_info['type'] == 'byte':
+                if isinstance(value, int):
+                    if not (0 <= value <= 255):
+                        return f"Line {line_number}: Type Error: 'byte' type must be an integer between 0 and 255."
+                else:
+                    return f"Line {line_number}: Type Error: 'byte' type must be assigned an integer value."
+            # Handle 'bool' type casting
+            if var_info['type'] == 'bool':
+                if isinstance(value, str):
+                    if value.lower() == 'true':
+                        value = True
+                    elif value.lower() == 'false':
+                        value = False
+                    else:
+                        return f"Line {line_number}: Type Error: Cannot cast string '{value}' to bool."
+                elif isinstance(value, bool):
+                    pass  # Already a bool
+                else:
+                    return f"Line {line_number}: Type Error: Cannot cast value '{value}' to bool."
+            # Handle 'char' type validation
+            if var_info['type'] == 'char':
+                if isinstance(value, str):
+                    if len(value) != 1:
+                        return f"Line {line_number}: Type Error: 'char' type must be a single character."
+                else:
+                    return f"Line {line_number}: Type Error: Cannot assign non-string value to 'char' type."
+            # Assign the new value
+            self.assign_variable(var_name, var_info['type'], value, is_private, var_info['const'])
+            return None  # Successful reassignment
+
+        # Variable is not declared yet; handle declaration
         # If type is not specified, infer it
         if var_type is None:
             inferred_type, value = self.infer_type(expr.strip(), line_number)
@@ -152,7 +216,7 @@ class KInterpreter:
             if var_type not in self.supported_types:
                 return f"Line {line_number}: Type Error: Unsupported type '{var_type}'. Supported types are: {', '.join(self.supported_types)}."
             value = self.evaluate_expression(expr.strip(), line_number)
-            # Handle special casting for bool
+            # Handle 'bool' type casting
             if var_type == 'bool':
                 if isinstance(value, str):
                     if value.lower() == 'true':
@@ -180,15 +244,26 @@ class KInterpreter:
                 else:
                     return f"Line {line_number}: Type Error: 'byte' type must be assigned an integer value."
 
+        # Determine if the variable is constant
+        is_const = True if modifier else False
+
         # Assign the variable
+        self.assign_variable(var_name, var_type, value, is_private, is_const)
+        return None  # Assignments do not produce output
+
+    def assign_variable(self, var_name, var_type, value, is_private, is_const=False):
+        """
+        Assign the variable with type, value, and const status.
+        """
+        var_data = {'type': var_type, 'value': value, 'const': is_const}
         if is_private:
             if not self.local_variables_stack:
-                return f"Line {line_number}: Scope Error: 'private' variable declared outside of a block."
-            self.local_variables_stack[-1][var_name] = {'type': var_type, 'value': value}
+                # If private modifier is used outside of a block, treat it as global
+                self.global_variables[var_name] = var_data
+            else:
+                self.local_variables_stack[-1][var_name] = var_data
         else:
-            self.global_variables[var_name] = {'type': var_type, 'value': value}
-
-        return None  # Assignments do not produce output
+            self.global_variables[var_name] = var_data
 
     def infer_type(self, expr, line_number):
         """
@@ -213,13 +288,28 @@ class KInterpreter:
     def evaluate_expression(self, expr, line_number):
         """
         Safely evaluate an arithmetic expression using AST.
-        Supports the 'type()' function.
+        Supports the 'type()' and '!' (invert) operators.
         """
+        # Replace '!' with 'invert(' only when it's a standalone operator (not part of '!=')
+        expr = self.replace_invert_operator(expr)
         try:
             node = ast.parse(expr, mode='eval').body
             return self._evaluate_ast(node, line_number)
+        except SyntaxError:
+            raise ValueError(f"Line {line_number}: Evaluation Error: invalid syntax")
         except Exception as e:
             raise ValueError(f"Line {line_number}: Evaluation Error: {e}")
+
+    def replace_invert_operator(self, expr):
+        """
+        Replace '!' with 'invert(' while ensuring '!=' is not altered.
+        """
+        # Replace '!' not followed by '=' with 'invert('
+        expr = re.sub(r'!(?!\=)', 'invert(', expr)
+        # Count the number of 'invert(' replaced to add closing parentheses
+        num_inverts = expr.count('invert(')
+        expr += ')' * num_inverts  # Add closing parentheses for each 'invert('
+        return expr
 
     def _evaluate_ast(self, node, line_number):
         """
@@ -239,7 +329,7 @@ class KInterpreter:
                 return self.operators[op_type](left, right)
             else:
                 raise ValueError(f"Unsupported operator: {op_type.__name__}")
-        elif isinstance(node, ast.UnaryOp):  # <operator> <operand> e.g., -1
+        elif isinstance(node, ast.UnaryOp):  # <operator> <operand> e.g., -1, invert(x)
             op_type = type(node.op)
             if op_type in self.operators:
                 operand = self._evaluate_ast(node.operand, line_number)
@@ -247,11 +337,10 @@ class KInterpreter:
             else:
                 raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
         elif isinstance(node, ast.Name):
-            id = node.id
-            # Handle boolean literals
-            if id.lower() == 'true':
+            id = node.id.lower()
+            if id == 'true':
                 return True
-            elif id.lower() == 'false':
+            elif id == 'false':
                 return False
             var_info = self.get_variable_info(id)
             if var_info:
@@ -265,6 +354,8 @@ class KInterpreter:
                 args = [self._evaluate_ast(arg, line_number) for arg in node.args]
                 if func_name == 'type':
                     return self.handle_type_function(args, line_number)
+                elif func_name == 'invert':
+                    return self.handle_invert_function(args, line_number)
                 else:
                     raise ValueError(f"Unsupported function: {func_name}")
             else:
@@ -294,9 +385,27 @@ class KInterpreter:
         else:
             return type(value).__name__
 
+    def handle_invert_function(self, args, line_number):
+        """
+        Handle the invert() function.
+        Usage: invert(variable)
+        """
+        if len(args) != 1:
+            raise ValueError("invert() function expects exactly one argument.")
+        x = args[0]
+        if isinstance(x, bool):
+            return not x
+        elif isinstance(x, (int, float)):
+            return -x
+        elif isinstance(x, str) and len(x) == 1:
+            # For char, invert the ASCII value and wrap around
+            return chr((-ord(x)) & 0xFF)
+        else:
+            raise TypeError(f"Line {line_number}: Type Error: Cannot invert type '{type(x).__name__}'.")
+
     def get_variable_info(self, var_name):
         """
-        Retrieve the variable's type and value, checking local scopes first.
+        Retrieve the variable's type, value, and const status, checking local scopes first.
         """
         # Check local scopes from top to bottom
         for local_vars in reversed(self.local_variables_stack):
